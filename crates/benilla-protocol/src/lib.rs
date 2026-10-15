@@ -70,11 +70,11 @@ impl std::fmt::Display for DialFailure {
 
 impl std::error::Error for DialFailure {}
 
-/// Resolves, then tries every resolved address in turn, IPv4 first ([`ipv4_first`]).
+/// Resolves, then dials the first IPv4 address ([`first_ipv4`]).
 fn dial(host: &str, port: u16) -> Result<TcpStream> {
     use std::net::ToSocketAddrs;
     let address = format!("{host}:{port}");
-    let mut addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
+    let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
         Ok(addrs) => addrs.collect(),
         Err(e) => {
             return Err(anyhow::Error::new(DialFailure {
@@ -84,14 +84,13 @@ fn dial(host: &str, port: u16) -> Result<TcpStream> {
             .context(format!("resolving {host}: {e}")))
         }
     };
-    if addrs.is_empty() {
+    let Some(target) = first_ipv4(&addrs) else {
         return Err(anyhow::Error::new(DialFailure {
             address,
             unresolved: true,
         }));
-    }
-    ipv4_first(&mut addrs);
-    TcpStream::connect(&addrs[..]).map_err(|e| {
+    };
+    TcpStream::connect(target).map_err(|e| {
         anyhow::Error::new(DialFailure {
             address,
             unresolved: false,
@@ -100,12 +99,11 @@ fn dial(host: &str, port: u16) -> Result<TcpStream> {
     })
 }
 
-/// Puts the IPv4 addresses first, keeping the resolver's order within each family. 1.12.1 dials
-/// IPv4 alone (`WowConnection::ConnectToHost`, `0x5b6e40`: `inet_addr`, else `gethostbyname`'s
-/// first address), while `localhost` resolves to `::1` first, which a realmd bound to IPv4 refuses
-/// only after about 2 s on Windows. IPv6 stays as the fallback.
-fn ipv4_first(addrs: &mut [SocketAddr]) {
-    addrs.sort_by_key(SocketAddr::is_ipv6);
+/// The address 1.12.1 dials: IPv4 alone, the first the resolver gives (`WowConnection::ConnectToHost`
+/// `0x5b6e40`: `inet_addr`, else `gethostbyname`'s first entry). `localhost` resolves to `::1`
+/// first, which a realmd bound to IPv4 refuses only after about 2 s on Windows.
+fn first_ipv4(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    addrs.iter().copied().find(SocketAddr::is_ipv4)
 }
 
 /// A realm from realmd's realm list, with every field the wire carries.
@@ -295,7 +293,7 @@ mod host_port_tests {
 
 #[cfg(test)]
 mod dial_tests {
-    use super::ipv4_first;
+    use super::first_ipv4;
     use std::net::SocketAddr;
 
     fn addrs(list: &[&str]) -> Vec<SocketAddr> {
@@ -303,29 +301,15 @@ mod dial_tests {
     }
 
     #[test]
-    fn localhost_dials_ipv4_before_ipv6() {
-        let mut got = addrs(&["[::1]:3724", "127.0.0.1:3724"]);
-        ipv4_first(&mut got);
-        assert_eq!(got, addrs(&["127.0.0.1:3724", "[::1]:3724"]));
+    fn localhost_dials_its_ipv4_address() {
+        let got = first_ipv4(&addrs(&["[::1]:3724", "127.0.0.1:3724"]));
+        assert_eq!(got, Some("127.0.0.1:3724".parse().unwrap()));
     }
 
     #[test]
-    fn each_family_keeps_the_resolver_order() {
-        let mut got = addrs(&[
-            "[2001:db8::2]:1",
-            "10.0.0.2:1",
-            "[2001:db8::1]:1",
-            "10.0.0.1:1",
-        ]);
-        ipv4_first(&mut got);
-        assert_eq!(
-            got,
-            addrs(&[
-                "10.0.0.2:1",
-                "10.0.0.1:1",
-                "[2001:db8::2]:1",
-                "[2001:db8::1]:1"
-            ])
-        );
+    fn the_first_ipv4_address_is_dialled_and_ipv6_never() {
+        let got = first_ipv4(&addrs(&["[2001:db8::2]:1", "10.0.0.2:1", "10.0.0.1:1"]));
+        assert_eq!(got, Some("10.0.0.2:1".parse().unwrap()));
+        assert_eq!(first_ipv4(&addrs(&["[2001:db8::1]:1"])), None);
     }
 }
